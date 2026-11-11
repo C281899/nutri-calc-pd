@@ -81,7 +81,7 @@ source .venv/bin/activate        # Linux/Mac
 .venv\Scripts\activate           # Windows
 
 # 3. Instalar dependências
-pip install -r requirements.txt
+pip install -r requirements.txt --upgrade
 
 # 4. Inicializar o banco de dados (apenas na primeira vez)
 python data/taco_setup.py

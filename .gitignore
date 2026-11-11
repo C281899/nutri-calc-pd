@@ -33,3 +33,6 @@ desktop.ini
 
 # Logs
 *.log
+
+# Testes
+.pytest_cache/

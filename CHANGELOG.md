@@ -1,5 +1,14 @@
 # CHANGELOG — NutriCalc P&D
 
+## v2.2.0 — 2026-11-11
+
+Auditoria completa com correção de erros de cálculo regulatório (Valores Diários,
+arredondamento e quantidades não significativas da IN 75/2020), de leitura de
+fichas, de backup e de desempenho. Lista completa em `AUDITORIA.md`.
+Inclui suíte de testes (`python -m pytest tests -q`).
+
+---
+
 ## v2.1.0 — 2026-05-22
 
 ### Resumo

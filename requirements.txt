@@ -1,8 +1,13 @@
-streamlit>=1.35.0
+# Interface — o app usa recursos do Streamlit 1.53+ (download gerado na hora do
+# clique, parâmetro width). Versões antigas quebram na abertura.
+streamlit>=1.53
 pandas>=2.2.2
 openpyxl>=3.1.2
-pillow>=10.4.0
-pdfplumber>=0.11.0
 rapidfuzz>=3.9.0
-numpy>=1.26.0
 
+# Leitura de fichas técnicas
+pdfplumber>=0.11.0
+xlrd>=2.0.1            # planilhas .xls antigas
+pymupdf>=1.24.0        # PDFs digitalizados (OCR)
+pytesseract>=0.3.10    # OCR — usa o tesseract instalado via packages.txt
+pillow>=10.4.0

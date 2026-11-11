@@ -125,29 +125,35 @@ def deletar_receita(id: int)
 
 ## ETAPA 2 — Calculator (calculator.py)
 
-### Constantes VD (RDC 429/2020 — Adultos):
+### Constantes VD (IN 75/2020, Anexo II):
 ```python
 VALORES_DIARIOS = {
     "energia_kcal": 2000,
     "energia_kj": 8400,
     "carboidrato": 300,
     "acucares_adicionados": 50,
-    "proteina": 75,
+    "proteina": 50,
     "lipideos": 65,
-    "gordura_saturada": 22,
+    "gordura_saturada": 20,
+    "gordura_trans": 2,
     "fibra_alimentar": 25,
-    "sodio": 2300,
+    "sodio": 2000,
 }
 ```
 
-### Regras de Arredondamento (RDC 429/2020):
+### Regras de Arredondamento (IN 75/2020, Anexo III):
 ```python
-# Energia: inteiro (kcal), inteiro (kj)
-# Carboidratos, proteínas, gorduras totais, saturadas, fibra: 1 decimal
-# Sódio: inteiro (mg)
-# %VD: inteiro (%)
-# Gorduras trans: se < 0.1g/porção → declarar "0 g (Não contém gorduras trans)"
-# Sódio: se < 1mg/porção → "0 mg"
+# Valor >= 10 ............ número inteiro
+# 1 <= valor < 10 ........ uma casa decimal
+# valor < 1 (g, kcal) .... uma casa decimal
+# valor < 1 (mg, mcg) .... duas casas decimais
+# Sempre "meio para cima" (0,25 → 0,3) — NÃO usar round() do Python.
+# %VD: inteiro.
+# Quantidades não significativas (Anexo IV) viram zero só quando o valor é
+# insignificante em 100 g E na porção: energia <= 4 kcal; carboidratos,
+# açúcares, proteínas, gorduras totais e fibras <= 0,5 g; saturadas e trans
+# <= 0,1 g; sódio <= 5 mg.
+# Açúcares totais NUNCA são estimados: sem dado informado → "Não informado".
 ```
 
 ### Funções obrigatórias:
@@ -339,16 +345,16 @@ maxUploadSize = 50
 gatherUsageStats = false
 ```
 
-### requirements.txt (versões fixadas):
+### requirements.txt:
+Ver o arquivo `requirements.txt` (Streamlit 1.53+, pymupdf e pytesseract para
+OCR, xlrd para .xls).
+
+### Testes:
+```bash
+python -m pytest tests -q
 ```
-streamlit==1.35.0
-pandas==2.2.2
-openpyxl==3.1.2
-pdfplumber==0.11.1
-rapidfuzz==3.9.3
-requests==2.32.3
-xlrd==2.0.1
-```
+Rodar sempre antes de publicar. `AUDITORIA.md` lista o que já foi corrigido e
+por quê — não reintroduzir.
 
 ---
 
