@@ -2,8 +2,8 @@
 validator.py — Motor de Validação e Triangulação TACO × TBCA
 
 Detecta dados inconsistentes nos registros da TACO usando 5 regras
-heurísticas e triangula com a TBCA (USP) como fonte secundária,
-mesclando nutriente a nutriente com estratégia seletiva.
+heurísticas e usa a TBCA (USP) como fonte secundária apenas para
+preencher lacunas — valores existentes na TACO nunca são substituídos.
 
 Rastreabilidade completa: cada triangulação gera registro de auditoria
 persistido em nutri_calc.db → tabela auditoria_triangulacoes.
@@ -170,53 +170,76 @@ def detectar_inconsistencias(nome_ingrediente: str, dados_taco: dict) -> dict:
 
 # ─── ETAPA 2.2 — Triangulação com TBCA ───────────────────────────────────────
 
-def _buscar_tbca(nome: str) -> tuple[dict | None, str, float]:
-    """
-    Busca alimento na TBCA por fuzzy match.
-    Retorna (dados_dict | None, nome_match, score_0_a_1).
-    """
-    if not os.path.exists(TBCA_DB):
-        return None, "", 0.0
+# Similaridade mínima de nome para considerar que TACO e TBCA falam do MESMO
+# alimento. Usa token_sort_ratio: "leite em pó desnatado" × "leite desnatado"
+# fica abaixo do corte (são alimentos diferentes), o que não acontecia com
+# token_set_ratio, que dava 100% sempre que um nome estava contido no outro.
+SCORE_MINIMO_MATCH = 0.88
 
+_cache_tbca: dict = {"mtime": None, "rows": [], "nomes": [], "norm": []}
+
+
+def _carregar_tbca() -> dict:
+    """Lê a TBCA uma vez por processo (recarrega se o arquivo mudar)."""
     try:
-        from rapidfuzz import fuzz, process
+        mtime = os.path.getmtime(TBCA_DB)
+    except OSError:
+        return {"rows": [], "nomes": [], "norm": []}
+    if _cache_tbca["mtime"] != mtime:
         con = sqlite3.connect(TBCA_DB)
         con.row_factory = sqlite3.Row
-        rows = con.execute("SELECT * FROM tbca_alimentos").fetchall()
-        con.close()
+        try:
+            rows = [dict(r) for r in con.execute("SELECT * FROM tbca_alimentos")]
+        finally:
+            con.close()
+        _cache_tbca.update(
+            mtime=mtime,
+            rows=rows,
+            nomes=[r["nome_alimento"] for r in rows],
+            norm=[_normalizar(r["nome_alimento"]) for r in rows],
+        )
+    return _cache_tbca
+
+
+def _buscar_tbca(nome: str) -> tuple[dict | None, str, float]:
+    """
+    Busca o mesmo alimento na TBCA.
+    Retorna (dados_dict | None, nome_match, score_0_a_1).
+    """
+    try:
+        from rapidfuzz import fuzz, process
+        base = _carregar_tbca()
     except Exception:
         return None, "", 0.0
 
-    if not rows:
+    if not base["rows"]:
         return None, "", 0.0
 
-    nomes_tbca = [r["nome_alimento"] for r in rows]
-    nome_norm  = _normalizar(nome)
-    nomes_norm = [_normalizar(n) for n in nomes_tbca]
+    result = process.extractOne(
+        _normalizar(nome), base["norm"], scorer=fuzz.token_sort_ratio
+    )
+    if not result:
+        return None, "", 0.0
 
-    def _tentar_match(query: str) -> tuple[int | None, float]:
-        result = process.extractOne(
-            query, nomes_norm, scorer=fuzz.token_set_ratio
-        )
-        if result:
-            _, score_bruto, idx = result
-            return idx, score_bruto / 100.0
-        return None, 0.0
+    _, score_bruto, idx = result
+    score = score_bruto / 100.0
+    if score >= SCORE_MINIMO_MATCH:
+        return dict(base["rows"][idx]), base["nomes"][idx], score
+    return None, base["nomes"][idx], score
 
-    idx, score = _tentar_match(nome_norm)
 
-    # Tentar variação singular/plural se score baixo
-    if score < 0.75:
-        variacao = (nome_norm[:-1] if nome_norm.endswith("s")
-                    else nome_norm + "s")
-        idx2, score2 = _tentar_match(variacao)
-        if score2 > score:
-            idx, score = idx2, score2
-
-    if idx is not None and score >= 0.60:
-        return dict(rows[idx]), nomes_tbca[idx], score
-
-    return None, "", 0.0
+def _mesmo_alimento(dados_taco: dict, dados_tbca: dict) -> bool:
+    """
+    Confere se os dois registros são compatíveis entre si: quando ambos têm
+    energia ou umidade, os valores não podem estar muito distantes.
+    """
+    e1, e2 = _safe(dados_taco.get("energia_kcal")), _safe(dados_tbca.get("energia_kcal"))
+    if e1 > 0 and e2 > 0 and abs(e1 - e2) / max(e1, e2) > 0.25:
+        return False
+    u1, u2 = _safe(dados_taco.get("umidade")), _safe(dados_tbca.get("umidade"))
+    if u1 > 0 and u2 > 0 and abs(u1 - u2) > 15:
+        return False
+    return True
 
 
 def triangular_com_tbca(
@@ -225,13 +248,19 @@ def triangular_com_tbca(
     inconsistencias: dict,
 ) -> dict:
     """
-    Busca equivalente na TBCA e mescla nutriente a nutriente,
-    priorizando TBCA somente onde a TACO é inconsistente.
+    Procura o mesmo alimento na TBCA e PREENCHE LACUNAS da TACO.
+
+    Regras de segurança:
+      - só há triangulação se o nome casar com score >= SCORE_MINIMO_MATCH e os
+        dois registros forem compatíveis (energia/umidade próximas);
+      - um valor da TACO maior que zero NUNCA é substituído nem promediado;
+      - só são preenchidos nutrientes ausentes/zerados na TACO que existam na TBCA;
+      - diferenças entre as fontes são apenas relatadas em 'divergencias'.
 
     Returns:
         {
           'dados_finais': dict,
-          'fonte_por_nutriente': dict,        # 'TACO' | 'TBCA' | 'TACO+TBCA'
+          'fonte_por_nutriente': dict,        # 'TACO' | 'TBCA'
           'match_tbca': str,
           'score_match': float,
           'triangulacao_aplicada': bool,
@@ -243,75 +272,55 @@ def triangular_com_tbca(
     dados_tbca, match_nome, score = _buscar_tbca(nome_ingrediente)
     score_inc = inconsistencias.get("score_confianca", 1.0)
 
-    if dados_tbca is None or score < 0.60:
+    def _sem_triangulacao(motivo: str) -> dict:
         return {
             "dados_finais":          dados_taco,
             "fonte_por_nutriente":   {n: "TACO" for n in _TODOS_NUTRIENTES},
             "match_tbca":            "",
-            "score_match":           score,
+            "score_match":           round(score, 3),
             "triangulacao_aplicada": False,
             "nutrientes_corrigidos": [],
             "nivel_confianca":       _nivel_confianca(score_inc),
-            "divergencias":          ["Sem equivalente na TBCA com score ≥ 60%"],
+            "divergencias":          [motivo],
         }
 
-    zerados   = set(inconsistencias.get("nutrientes_zerados",   []))
-    suspeitos = set(inconsistencias.get("nutrientes_suspeitos", []))
+    if dados_tbca is None:
+        return _sem_triangulacao(
+            f"Sem equivalente na TBCA com similaridade ≥ {SCORE_MINIMO_MATCH:.0%}"
+        )
+    if not _mesmo_alimento(dados_taco, dados_tbca):
+        return _sem_triangulacao(
+            f"'{match_nome}' (TBCA) tem energia/umidade incompatíveis — não utilizado"
+        )
 
-    dados_finais        = {}
+    dados_finais        = dict(dados_taco)
     fonte_por_nutriente = {}
     corrigidos          = []
     divergencias        = []
-    n_concordantes      = 0
-    n_total             = len(_TODOS_NUTRIENTES)
 
     for nutriente in _TODOS_NUTRIENTES:
         val_taco = _safe(dados_taco.get(nutriente, 0))
         val_tbca = _safe(dados_tbca.get(nutriente, 0))
+        fonte_por_nutriente[nutriente] = "TACO"
 
         if val_taco == 0 and val_tbca > 0:
-            # Gap na TACO → usar TBCA
             dados_finais[nutriente]        = val_tbca
             fonte_por_nutriente[nutriente] = "TBCA"
             corrigidos.append({"nutriente": nutriente,
-                                "val_taco": val_taco, "val_tbca": val_tbca})
-            n_concordantes += 0.9  # quase certo
-
-        elif nutriente in suspeitos and val_tbca > 0:
-            # Suspeito na TACO → usar TBCA
-            dados_finais[nutriente]        = val_tbca
-            fonte_por_nutriente[nutriente] = "TBCA"
-            corrigidos.append({"nutriente": nutriente,
-                                "val_taco": val_taco, "val_tbca": val_tbca})
-            n_concordantes += 0.6
-
+                               "val_taco": val_taco, "val_tbca": val_tbca})
         elif val_taco > 0 and val_tbca > 0:
-            ref  = max(val_taco, val_tbca)
-            diff = abs(val_taco - val_tbca) / ref
-
-            if diff < 0.20:
-                # Diferença < 20% → média ponderada TACO 60 / TBCA 40
-                dados_finais[nutriente]        = round(val_taco * 0.6 + val_tbca * 0.4, 4)
-                fonte_por_nutriente[nutriente] = "TACO+TBCA"
-                n_concordantes += 1.0
-            else:
-                # Divergência ≥ 20% → usar TBCA, registrar
-                dados_finais[nutriente]        = val_tbca
-                fonte_por_nutriente[nutriente] = "TBCA"
+            diff = abs(val_taco - val_tbca) / max(val_taco, val_tbca)
+            if diff >= 0.20:
                 divergencias.append(
                     f"{nutriente}: TACO={val_taco:.3g} vs TBCA={val_tbca:.3g} "
-                    f"(dif. {diff:.0%})"
+                    f"(dif. {diff:.0%}) — mantido o valor da TACO"
                 )
-                n_concordantes += 0.5
 
-        else:
-            # TACO e TBCA ambos zero ou só TACO tem valor
-            dados_finais[nutriente]        = val_taco
-            fonte_por_nutriente[nutriente] = "TACO"
-            n_concordantes += 1.0
-
-    score_final = n_concordantes / n_total if n_total else 0.0
-    nivel       = _nivel_confianca(score_final)
+    if not corrigidos:
+        res = _sem_triangulacao("TBCA não tinha nenhum valor ausente na TACO")
+        res["match_tbca"]   = match_nome
+        res["divergencias"] = divergencias or res["divergencias"]
+        return res
 
     return {
         "dados_finais":          dados_finais,
@@ -320,7 +329,7 @@ def triangular_com_tbca(
         "score_match":           round(score, 3),
         "triangulacao_aplicada": True,
         "nutrientes_corrigidos": corrigidos,
-        "nivel_confianca":       nivel,
+        "nivel_confianca":       _nivel_confianca(score),
         "divergencias":          divergencias,
     }
 

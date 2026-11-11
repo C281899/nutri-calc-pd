@@ -7,28 +7,47 @@ calcular_composicao_receita aceita: ingredientes, receita_id (opcional), validar
 from __future__ import annotations
 from typing import Any
 
-# ─── Valores Diários de Referência (RDC 429/2020 — Adultos) ───────────────────
+# ─── Valores Diários de Referência (IN 75/2020, Anexo II) ─────────────────────
 VALORES_DIARIOS = {
     "energia_kcal":         2000.0,
     "energia_kj":           8400.0,
     "carboidrato":           300.0,
     "acucares_adicionados":   50.0,
-    "proteina":               75.0,
+    "proteina":               50.0,
     "lipideos":               65.0,
-    "gordura_saturada":       22.0,
+    "gordura_saturada":       20.0,
+    "gordura_trans":           2.0,
     "fibra_alimentar":        25.0,
-    "sodio":                2300.0,
+    "sodio":                2000.0,
 }
 
-# Nutrientes que não têm %VD estabelecido
-SEM_VD = {"acucares_totais", "gordura_trans", "colesterol"}
+KCAL_PARA_KJ = 4.184
 
-# ─── Limites "Não contém" (RDC 429/2020) ──────────────────────────────────────
-LIMITES_NAO_CONTEM = {
-    "gordura_trans":  0.1,   # g/porção
-    "sodio":          1.0,   # mg/porção
-    "energia_kcal":   4.0,   # kcal/porção
-    "energia_kj":    17.0,   # kJ/porção
+# Nutrientes que não têm %VD estabelecido
+SEM_VD = {"acucares_totais", "colesterol"}
+
+# ─── Quantidades não significativas (IN 75/2020, Anexo IV) ────────────────────
+# Declaradas como zero quando o valor em 100 g E na porção não ultrapassa o limite.
+LIMITES_NAO_SIGNIFICATIVOS = {
+    "energia_kcal":         4.0,    # kcal
+    "carboidrato":          0.5,    # g
+    "acucares_totais":      0.5,
+    "proteina":             0.5,
+    "lipideos":             0.5,
+    "gordura_saturada":     0.1,
+    "gordura_trans":        0.1,
+    "fibra_alimentar":      0.5,
+    "sodio":                5.0,    # mg
+    "colesterol":           5.0,    # mg
+}
+
+# Unidade de cada linha do rótulo (define a regra de arredondamento abaixo de 1)
+UNIDADES_ROTULO = {
+    "energia_kcal": "kcal", "energia_kj": "kJ",
+    "carboidrato": "g", "acucares_totais": "g", "acucares_adicionados": "g",
+    "proteina": "g", "lipideos": "g", "gordura_saturada": "g",
+    "gordura_trans": "g", "fibra_alimentar": "g",
+    "sodio": "mg", "colesterol": "mg",
 }
 
 
@@ -40,6 +59,45 @@ def _safe_float(valor: Any, default: float = 0.0) -> float:
         return float(valor)
     except (ValueError, TypeError):
         return default
+
+
+def _half_up(valor: float, casas: int = 0) -> float:
+    """Arredonda "meio para cima" (0,25 → 0,3), como exige a IN 75/2020.
+    O round() do Python arredonda para o par mais próximo (0,25 → 0,2)."""
+    from decimal import Decimal, ROUND_HALF_UP
+    q = Decimal(1).scaleb(-casas)
+    return float(Decimal(repr(float(valor))).quantize(q, rounding=ROUND_HALF_UP))
+
+
+def arredondar_anvisa(valor: Any, unidade: str = "g") -> float:
+    """
+    Arredondamento da IN 75/2020, Anexo III:
+      - 10 ou mais ............ número inteiro
+      - de 1 a menos de 10 .... uma casa decimal
+      - menos de 1 (g, kcal) .. uma casa decimal
+      - menos de 1 (mg, mcg) .. duas casas decimais
+    """
+    v = _safe_float(valor)
+    if v <= 0:
+        return 0.0
+    if v >= 10:
+        return _half_up(v, 0)
+    if v >= 1:
+        r = _half_up(v, 1)
+        return _half_up(r, 0) if r >= 10 else r
+    return _half_up(v, 2 if unidade in ("mg", "mcg") else 1)
+
+
+def formatar_rotulo(valor: Any, unidade: str) -> str:
+    """Texto do valor como vai no rótulo: sem zeros desnecessários, vírgula decimal."""
+    if valor is None:
+        return "Não informado"
+    v = _safe_float(valor)
+    if v == int(v):
+        txt = str(int(v))
+    else:
+        txt = f"{v:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+    return f"{txt} {unidade}"
 
 
 def smart_round(valor, contexto: str = "display"):
@@ -175,6 +233,14 @@ def calcular_composicao_receita(
         # ── Cálculo da contribuição ───────────────────────────────────────────
         fator  = qtd / 100.0
         contrib = {}
+        # Ficha só com kcal (ou só com kJ): completa a outra unidade, senão o
+        # total em kJ da receita sairia menor que o equivalente em kcal.
+        kcal_ing = _safe_float(comp.get("energia_kcal"))
+        kj_ing   = _safe_float(comp.get("energia_kj"))
+        if kcal_ing > 0 and kj_ing <= 0:
+            comp = {**comp, "energia_kj": kcal_ing * KCAL_PARA_KJ}
+        elif kj_ing > 0 and kcal_ing <= 0:
+            comp = {**comp, "energia_kcal": kj_ing / KCAL_PARA_KJ}
         for nutriente in NUTRIENTES:
             val          = _safe_float(comp.get(nutriente, 0))
             contribuicao = val * fator
@@ -226,80 +292,87 @@ def calcular_por_porcao(composicao_total: dict, peso_total_gramas: float, porcao
     return {n: v * fator for n, v in composicao_total.items()}
 
 
-def calcular_vd(por_porcao: dict, acucares_adicionados_porcao: float = 0.0,
-                gordura_saturada_porcao: float = 0.0, gordura_trans_porcao: float = 0.0) -> dict:
+def calcular_vd(por_porcao: dict, acucares_adicionados_porcao: float | None = None,
+                gordura_saturada_porcao: float | None = None,
+                gordura_trans_porcao: float | None = None) -> dict:
     """
-    Calcula %VD para cada nutriente obrigatório conforme RDC 429/2020.
+    Calcula %VD (inteiro) a partir dos valores declarados na porção.
+    Os três parâmetros opcionais existem por compatibilidade; quando omitidos,
+    os valores são lidos de por_porcao.
     """
-    vd = {}
+    valores = dict(por_porcao)
+    if acucares_adicionados_porcao is not None:
+        valores["acucares_adicionados"] = acucares_adicionados_porcao
+    if gordura_saturada_porcao is not None:
+        valores["gordura_saturada"] = gordura_saturada_porcao
+    if gordura_trans_porcao is not None:
+        valores["gordura_trans"] = gordura_trans_porcao
 
-    mapeamento = {
-        "energia_kcal":   ("energia_kcal",  VALORES_DIARIOS["energia_kcal"]),
-        "carboidrato":    ("carboidrato",    VALORES_DIARIOS["carboidrato"]),
-        "proteina":       ("proteina",       VALORES_DIARIOS["proteina"]),
-        "lipideos":       ("lipideos",       VALORES_DIARIOS["lipideos"]),
-        "fibra_alimentar":("fibra_alimentar",VALORES_DIARIOS["fibra_alimentar"]),
-        "sodio":          ("sodio",          VALORES_DIARIOS["sodio"]),
-    }
+    vd: dict = {}
+    for nutriente in ("energia_kcal", "carboidrato", "acucares_adicionados",
+                      "proteina", "lipideos", "gordura_saturada", "gordura_trans",
+                      "fibra_alimentar", "sodio"):
+        ref = VALORES_DIARIOS[nutriente]
+        val = _safe_float(valores.get(nutriente, 0))
+        vd[nutriente] = int(_half_up(val / ref * 100, 0))
 
-    for key, (nutriente, vd_ref) in mapeamento.items():
-        val = _safe_float(por_porcao.get(nutriente, 0))
-        vd[key] = round((val / vd_ref) * 100) if vd_ref > 0 else 0
-
-    # Gordura saturada e açúcares adicionados (informados separadamente)
-    vd["gordura_saturada"] = round((gordura_saturada_porcao / VALORES_DIARIOS["gordura_saturada"]) * 100)
-    vd["acucares_adicionados"] = round((acucares_adicionados_porcao / VALORES_DIARIOS["acucares_adicionados"]) * 100)
-
-    # Gorduras trans e açúcares totais: não têm %VD
-    vd["gordura_trans"] = None
+    # Açúcares totais: não há Valor Diário estabelecido
     vd["acucares_totais"] = None
-
     return vd
 
 
-def aplicar_arredondamentos(valores: dict, porcao_gramas: float) -> dict:
+def aplicar_arredondamentos(valores: dict, porcao_gramas: float = 100.0) -> dict:
     """
-    Aplica regras de arredondamento da RDC 429/2020.
-
-    Regras:
-    - Energia kcal/kJ: inteiro
-    - Carboidratos, proteínas, gorduras, fibra: 1 decimal
-    - Sódio: inteiro (mg)
-    - Gorduras trans: "0 g" se < 0,1g/porção
-    - Sódio: "0 mg" se < 1mg/porção
+    Aplica o arredondamento da IN 75/2020 (Anexo III) às linhas do rótulo.
+    Valores None (não informados) são preservados. Os demais nutrientes do
+    dicionário (micronutrientes da aba P&D) não são alterados.
     """
     r = dict(valores)
-
-    # Energia
-    r["energia_kcal"] = round(_safe_float(r.get("energia_kcal", 0)))
-    r["energia_kj"]   = round(_safe_float(r.get("energia_kj",   0)))
-
-    # Macros: 1 decimal
-    for n in ["carboidrato", "proteina", "lipideos", "fibra_alimentar",
-              "gordura_saturada", "gordura_trans", "acucares_totais", "acucares_adicionados"]:
-        if n in r:
-            val = _safe_float(r.get(n, 0))
-            r[n] = round(val, 1)
-
-    # Sódio: inteiro (mg)
-    r["sodio"] = round(_safe_float(r.get("sodio", 0)))
-
-    # Colesterol: inteiro (mg) — se presente
-    if "colesterol" in r:
-        r["colesterol"] = round(_safe_float(r.get("colesterol", 0)))
-
-    # Regra "Não contém gorduras trans"
-    if _safe_float(r.get("gordura_trans", 0)) < 0.1:
-        r["gordura_trans_rotulo"] = "0 g**"
-        r["gordura_trans"] = 0.0
-    else:
-        r["gordura_trans_rotulo"] = f'{r["gordura_trans"]:.1f} g'
-
-    # Regra "Não contém" para sódio
-    if _safe_float(r.get("sodio", 0)) < 1:
-        r["sodio"] = 0
-
+    for nutriente, unidade in UNIDADES_ROTULO.items():
+        if nutriente not in r or r[nutriente] is None:
+            continue
+        r[nutriente] = arredondar_anvisa(r[nutriente], unidade)
     return r
+
+
+def _zerar_nao_significativos(bruto_100g: dict, bruto_porcao: dict,
+                              por_100g: dict, por_porcao: dict) -> None:
+    """
+    Declara zero quando o valor em 100 g E na porção é não significativo
+    (IN 75/2020, Anexo IV), respeitando as condições do próprio anexo:
+      - gorduras totais só zeram se saturadas e trans também forem zero;
+      - carboidratos só zeram se os açúcares totais também forem zero;
+      - açúcares totais só zeram se não houver açúcares adicionados.
+    """
+    def _insignificante(nutriente: str) -> bool:
+        limite = LIMITES_NAO_SIGNIFICATIVOS[nutriente]
+        v100, vpor = bruto_100g.get(nutriente), bruto_porcao.get(nutriente)
+        if v100 is None or vpor is None:
+            return False
+        return _safe_float(v100) <= limite and _safe_float(vpor) <= limite
+
+    def _presente(nutriente: str) -> bool:
+        """Há valor informado e ele é significativo."""
+        return bruto_100g.get(nutriente) is not None and not _insignificante(nutriente)
+
+    tem_adicionado = (_safe_float(bruto_100g.get("acucares_adicionados")) > 0
+                      or _safe_float(bruto_porcao.get("acucares_adicionados")) > 0)
+    depende_de = {
+        "lipideos":        lambda: _presente("gordura_saturada") or _presente("gordura_trans"),
+        "carboidrato":     lambda: _presente("acucares_totais") or tem_adicionado,
+        "acucares_totais": lambda: tem_adicionado,
+    }
+
+    for nutriente in LIMITES_NAO_SIGNIFICATIVOS:
+        if not _insignificante(nutriente):
+            continue
+        if nutriente in depende_de and depende_de[nutriente]():
+            continue
+        por_100g[nutriente] = 0.0
+        por_porcao[nutriente] = 0.0
+        if nutriente == "energia_kcal":
+            por_100g["energia_kj"] = 0.0
+            por_porcao["energia_kj"] = 0.0
 
 
 def montar_tabela_rotulo(
@@ -312,9 +385,14 @@ def montar_tabela_rotulo(
     gordura_trans_total: float = 0.0,
     num_porcoes: int | None = None,
     medida_caseira: str | None = None,
+    acucares_totais_total: float | None = None,
 ) -> dict:
     """
     Função principal: monta a tabela completa para o rótulo ANVISA.
+
+    acucares_totais_total: açúcares totais da receita inteira, em gramas.
+        A TACO não traz esse dado; quando não informado (None) a linha sai como
+        "Não informado" em vez de um valor estimado.
 
     Returns:
         dict com:
@@ -323,49 +401,48 @@ def montar_tabela_rotulo(
             - vd: dict (%VD por nutriente)
             - info: dict (metadados para o rótulo)
     """
-    # Calcular por 100g
-    por_100g_raw  = calcular_por_100g_produto(nutrientes_totais, peso_total)
+    por_100g_raw   = calcular_por_100g_produto(nutrientes_totais, peso_total)
     por_porcao_raw = calcular_por_porcao(nutrientes_totais, peso_total, porcao_gramas)
 
-    # Calcular gordura saturada e trans a partir do lipídios (estimativa)
-    # Nota: TACO não diferencia gordura saturada — usuário deve informar ou estimar
-    gord_sat_porcao   = gordura_saturada_total * (porcao_gramas / peso_total) if peso_total > 0 else 0
-    gord_trans_porcao = gordura_trans_total    * (porcao_gramas / peso_total) if peso_total > 0 else 0
-    acucar_ad_porcao  = acucares_adicionados_total * (porcao_gramas / peso_total) if peso_total > 0 else 0
+    f100 = 100.0 / peso_total if peso_total > 0 else 0.0
+    fpor = porcao_gramas / peso_total if peso_total > 0 else 0.0
 
-    # Adicionar campos extras ao por_porcao_raw
-    por_porcao_raw["gordura_saturada"]    = gord_sat_porcao
-    por_porcao_raw["gordura_trans"]       = gord_trans_porcao
-    por_porcao_raw["acucares_adicionados"] = acucar_ad_porcao
-    por_porcao_raw["acucares_totais"]     = por_porcao_raw.get("carboidrato", 0) * 0.4  # estimativa
+    informados = {
+        "gordura_saturada":     _safe_float(gordura_saturada_total),
+        "gordura_trans":        _safe_float(gordura_trans_total),
+        "acucares_adicionados": _safe_float(acucares_adicionados_total),
+    }
+    for chave, total in informados.items():
+        por_100g_raw[chave]   = total * f100
+        por_porcao_raw[chave] = total * fpor
 
-    por_100g_raw["gordura_saturada"]    = gordura_saturada_total * 100 / peso_total if peso_total > 0 else 0
-    por_100g_raw["gordura_trans"]       = gordura_trans_total    * 100 / peso_total if peso_total > 0 else 0
-    por_100g_raw["acucares_adicionados"] = acucares_adicionados_total * 100 / peso_total if peso_total > 0 else 0
-    por_100g_raw["acucares_totais"]     = por_100g_raw.get("carboidrato", 0) * 0.4
+    if acucares_totais_total is None:
+        por_100g_raw["acucares_totais"]   = None
+        por_porcao_raw["acucares_totais"] = None
+    else:
+        por_100g_raw["acucares_totais"]   = _safe_float(acucares_totais_total) * f100
+        por_porcao_raw["acucares_totais"] = _safe_float(acucares_totais_total) * fpor
 
-    # Arredondar
     por_100g   = aplicar_arredondamentos(por_100g_raw,   100)
     por_porcao = aplicar_arredondamentos(por_porcao_raw, porcao_gramas)
+    _zerar_nao_significativos(por_100g_raw, por_porcao_raw, por_100g, por_porcao)
 
-    # Calcular %VD
-    vd = calcular_vd(
-        por_porcao,
-        acucares_adicionados_porcao=acucar_ad_porcao,
-        gordura_saturada_porcao=gord_sat_porcao,
-        gordura_trans_porcao=gord_trans_porcao,
-    )
+    # Texto da linha de gorduras trans (mantido para compatibilidade)
+    por_porcao["gordura_trans_rotulo"] = formatar_rotulo(por_porcao["gordura_trans"], "g")
+
+    vd = calcular_vd(por_porcao)
 
     return {
-        "por_100g":   por_100g,
-        "por_porcao": por_porcao,
-        "vd":         vd,
+        "por_100g":     por_100g,
+        "por_porcao":   por_porcao,
+        "por_100g_bruto": por_100g_raw,
+        "vd":           vd,
         "info": {
             "nome_produto":   nome_produto,
             "porcao_gramas":  porcao_gramas,
             "peso_total":     peso_total,
             "num_porcoes":    num_porcoes,
-            "medida_caseira": medida_caseira or f"{porcao_gramas:.0f} g",
+            "medida_caseira": medida_caseira or "",
         },
     }
 
@@ -404,8 +481,8 @@ def calcular_contribuicoes_percentuais(detalhes: list[dict]) -> list[dict]:
 #    manualmente pelo usuário ou calculadas por formulação específica.
 # 2. Açúcares adicionados ≠ açúcares totais — a TACO não diferencia; usuário deve
 #    informar separadamente a quantidade de açúcar adicionado na formulação.
-# 3. Açúcares totais são estimados como 40% dos carboidratos — isso é uma estimativa
-#    grosseira; o valor real depende da composição específica dos ingredientes.
+# 3. Açúcares totais não constam na TACO — devem ser informados pelo usuário;
+#    sem esse dado a linha do rótulo sai como "Não informado" (nunca estimada).
 # 4. Perdas nutricionais por processamento térmico (cozimento, pasteurização, etc.)
 #    NÃO são calculadas — a TACO fornece valores de alimentos crus ou em estado padrão.
 # 5. Medida caseira deve ser informada manualmente — não é calculada automaticamente.

@@ -8,9 +8,11 @@ Produz duas abas:
 import io
 from openpyxl import Workbook
 from openpyxl.styles import (
-    Font, PatternFill, Border, Side, Alignment, numbers
+    Font, PatternFill, Border, Side, Alignment
 )
 from openpyxl.utils import get_column_letter
+
+from modules.calculator import formatar_rotulo
 
 # ─── Paleta de cores ───────────────────────────────────────────────────────────
 COR_HEADER_ANVISA = "1F4E79"   # Azul escuro — cabeçalho "INFORMAÇÃO NUTRICIONAL"
@@ -138,8 +140,10 @@ def _construir_aba_rotulo(ws, nome_produto, porcao_gramas, num_porcoes,
     linha += 1
 
     # ── Linha 3: Porção ─────────────────────────────────────────────────────────
-    medida = medida_caseira or f"{porcao_gramas:.0f} g"
-    texto_porcao = f"Porção de {porcao_gramas:.0f} g ({medida})"
+    porcao_txt = formatar_rotulo(porcao_gramas, "g")
+    texto_porcao = f"Porção de {porcao_txt}"
+    if medida_caseira:
+        texto_porcao += f" ({medida_caseira})"
     if num_porcoes:
         texto_porcao += f"  |  {num_porcoes} porção{'ões' if num_porcoes > 1 else ''} por embalagem"
 
@@ -152,7 +156,7 @@ def _construir_aba_rotulo(ws, nome_produto, porcao_gramas, num_porcoes,
     linha += 1
 
     # ── Linha 4: Cabeçalho da tabela ────────────────────────────────────────────
-    cabecalhos = ["", f"Por 100 g", f"Por Porção ({porcao_gramas:.0f} g)", "%VD*"]
+    cabecalhos = ["", "Por 100 g", f"Por Porção ({porcao_txt})", "%VD*"]
     for col, txt in enumerate(cabecalhos, 1):
         cel = ws.cell(linha, col, txt)
         cel.font      = Font(name="Arial", bold=True, size=10, color="FFFFFF")
@@ -174,44 +178,16 @@ def _construir_aba_rotulo(ws, nome_produto, porcao_gramas, num_porcoes,
         cel.border    = BORDA_FINA
         cel.alignment = _alinhar("left", "center")
 
-        # Coluna B — Por 100g
-        val_100g = por_100g.get(ch100, 0)
-        if val_100g is None:
-            val_100g = 0
-        if ch100 == "gordura_trans":
-            texto_100g = f"{val_100g:.1f} {unidade}"
-        elif unidade == "kcal":
-            texto_100g = f"{int(val_100g)} {unidade}"
-        elif unidade == "kJ":
-            texto_100g = f"{int(val_100g)} {unidade}"
-        elif unidade == "mg":
-            texto_100g = f"{int(val_100g)} {unidade}"
-        else:
-            texto_100g = f"{val_100g:.1f} {unidade}"
+        # Colunas B e C — valores já arredondados pela IN 75/2020 (Anexo III);
+        # None = dado não informado (ex.: açúcares totais)
+        texto_100g       = formatar_rotulo(por_100g.get(ch100), unidade)
+        texto_porcao_cel = formatar_rotulo(por_porcao.get(chporcao), unidade)
 
         cel2 = ws.cell(linha, 2, texto_100g)
         cel2.font      = _fonte(size=10)
         cel2.fill      = _fill(cor_bg)
         cel2.border    = BORDA_FINA
         cel2.alignment = _alinhar("center", "center")
-
-        # Coluna C — Por porção
-        val_porcao = por_porcao.get(chporcao, 0)
-        if val_porcao is None:
-            val_porcao = 0
-
-        # Caso especial: gordura trans
-        rotulo_trans = por_porcao.get("gordura_trans_rotulo", None)
-        if ch100 == "gordura_trans" and rotulo_trans:
-            texto_porcao_cel = rotulo_trans
-        elif unidade == "kcal":
-            texto_porcao_cel = f"{int(val_porcao)} {unidade}"
-        elif unidade == "kJ":
-            texto_porcao_cel = f"{int(val_porcao)} {unidade}"
-        elif unidade == "mg":
-            texto_porcao_cel = f"{int(val_porcao)} {unidade}"
-        else:
-            texto_porcao_cel = f"{val_porcao:.1f} {unidade}"
 
         cel3 = ws.cell(linha, 3, texto_porcao_cel)
         cel3.font      = _fonte(size=10)
@@ -220,12 +196,12 @@ def _construir_aba_rotulo(ws, nome_produto, porcao_gramas, num_porcoes,
         cel3.alignment = _alinhar("center", "center")
 
         # Coluna D — %VD
-        if chvd and chvd in vd and vd[chvd] is not None:
+        if unidade == "kJ":
+            texto_vd = ""
+        elif chvd and vd.get(chvd) is not None:
             texto_vd = f"{vd[chvd]}%"
-        elif chvd in (None, "gordura_trans", "acucares_totais"):
-            texto_vd = "**"
         else:
-            texto_vd = "—"
+            texto_vd = "**"
 
         cel4 = ws.cell(linha, 4, texto_vd)
         cel4.font      = _fonte(size=10)
@@ -238,21 +214,23 @@ def _construir_aba_rotulo(ws, nome_produto, porcao_gramas, num_porcoes,
 
     # ── Rodapé ──────────────────────────────────────────────────────────────────
     linha += 1
-    rodape1 = ("* % Valores Diários de referência com base em uma dieta de 2.000 kcal ou 8.400 kJ. "
-               "Seus valores diários podem ser maiores ou menores dependendo de suas necessidades energéticas.")
+    rodape1 = "* Percentual de valores diários fornecidos pela porção."
     ws.merge_cells(f"A{linha}:D{linha}")
     cel = ws.cell(linha, 1, rodape1)
     cel.font      = Font(name="Arial", italic=True, size=8, color="555555")
     cel.alignment = _alinhar("left", "top", wrap=True)
-    ws.row_dimensions[linha].height = 30
+    ws.row_dimensions[linha].height = 14
     linha += 1
 
     rodape2 = "** Valor Diário não estabelecido."
+    if por_porcao.get("acucares_totais") is None:
+        rodape2 += ("  |  Açúcares totais: não informado — a TACO não traz este dado; "
+                    "informe-o no sistema antes de emitir o rótulo.")
     ws.merge_cells(f"A{linha}:D{linha}")
     cel = ws.cell(linha, 1, rodape2)
     cel.font      = Font(name="Arial", italic=True, size=8, color="555555")
-    cel.alignment = _alinhar("left", "center")
-    ws.row_dimensions[linha].height = 14
+    cel.alignment = _alinhar("left", "top", wrap=True)
+    ws.row_dimensions[linha].height = 26
     linha += 1
 
     rodape3 = ("⚠️  USO INTERNO — P&D  |  Validar com nutricionista habilitado (CRN) "
@@ -332,7 +310,7 @@ def _construir_aba_pd(ws, nome_produto, porcao_gramas, detalhes, por_100g, por_p
         ws.column_dimensions[col_letter].width = 11
 
     # Calcular totais e percentuais
-    peso_total_real = sum(ing["quantidade_gramas"] for ing in detalhes) if detalhes else 1
+    peso_total_real = sum(ing["quantidade_gramas"] for ing in detalhes) if detalhes else 0
 
     # Calcular totais por nutriente
     totais_nut = {n: 0.0 for n in NUTRIENTES}
@@ -356,10 +334,13 @@ def _construir_aba_pd(ws, nome_produto, porcao_gramas, detalhes, por_100g, por_p
         nome_ing   = ing.get("nome", "?")
         fonte_ing  = ing.get("fonte", "?")
         triangulou = nome_ing in _nomes_triangulados
+        fonte_registro = (ing.get("composicao_100g") or {}).get("fonte_dados")
         if triangulou:
-            fonte_dados_label = "TACO + TBCA (triangulado)"
+            fonte_dados_label = "TACO + TBCA (lacunas)"
+        elif fonte_registro:
+            fonte_dados_label = fonte_registro
         elif fonte_ing == "TACO":
-            fonte_dados_label = "TACO 4ª Ed. — UNICAMP"
+            fonte_dados_label = "TACO 4ª edição"
         else:
             fonte_dados_label = "Fornecedor"
 
@@ -450,7 +431,8 @@ def _construir_aba_pd(ws, nome_produto, porcao_gramas, detalhes, por_100g, por_p
 
     for j, n in enumerate(NUTRIENTES):
         col_abs = _NUT_START + j * 2
-        val_100g = por_100g.get(n, 0) or 0
+        # valor técnico (sem o arredondamento de rótulo), a partir dos totais
+        val_100g = (totais_nut.get(n, 0) / peso_total_real * 100) if peso_total_real > 0 else 0
         cel = ws.cell(linha_100g, col_abs, round(float(val_100g), 4))
         cel.font          = Font(name="Arial", bold=True, size=9, color="FFFFFF")
         cel.fill          = _fill(COR_HEADER_ANVISA)
@@ -471,14 +453,14 @@ def _construir_aba_pd(ws, nome_produto, porcao_gramas, detalhes, por_100g, por_p
     n_tri = len(alertas_validacao)
     tem_tbca = n_tri > 0
 
-    rodape_fontes = (
-        "Fontes: TACO 4ª Edição (UNICAMP, 2011) | TBCA 7.0 (USP/FCF, 2023)"
-        if tem_tbca else
-        "Fonte: TACO 4ª Edição (UNICAMP, 2011)"
-    )
+    fontes_usadas = sorted({
+        (ing.get("composicao_100g") or {}).get("fonte_dados") or ing.get("fonte", "?")
+        for ing in detalhes
+    })
+    rodape_fontes = "Fontes dos dados: " + "; ".join(fontes_usadas)
     if tem_tbca:
         rodape_fontes += (
-            f" | Triangulação automática aplicada em {n_tri} ingrediente(s): "
+            f" | Valores ausentes na TACO preenchidos com a TBCA em {n_tri} ingrediente(s): "
             + ", ".join(a["ingrediente"] for a in alertas_validacao)
         )
     rodape_fontes += " | Recomenda-se validação por nutricionista habilitado (CRN)."
@@ -497,8 +479,8 @@ def _construir_aba_pd(ws, nome_produto, porcao_gramas, detalhes, por_100g, por_p
         )
         cel_rod2 = ws.cell(
             linha_rod2, 1,
-            "⚠  Ingredientes com triangulação TACO+TBCA: os valores nutricionais foram "
-            "corrigidos automaticamente onde a TACO apresentava dados incompletos. "
+            "⚠  Ingredientes completados com a TBCA: apenas nutrientes ausentes na TACO "
+            "foram preenchidos; nenhum valor existente foi substituído. "
             "Verifique a seção 'Rastreabilidade das Fontes' no sistema antes de emitir rótulo."
         )
         cel_rod2.font      = Font(name="Arial", italic=True, size=8, color="C0392B")

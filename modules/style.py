@@ -192,8 +192,10 @@ hr {
 }
 
 /* ── Caption ──────────────────────────────────────────────────────────────── */
+/* Legendas trazem informação de trabalho (peso total, porção, avisos):
+   precisam de contraste legível sobre o fundo escuro. */
 small, .stCaption, [data-testid="stCaptionContainer"] * {
-    color: var(--text-muted) !important;
+    color: #7FA3CC !important;
     font-size: 11px !important;
 }
 
@@ -391,7 +393,7 @@ def render_sidebar(db_count: int = 0):
           </div>
         </div>
       </div>
-      <div style="font-size:10px;color:#4A6080;margin-top:6px;">v2.0 &middot; Uso Interno</div>
+      <div style="font-size:10px;color:#4A6080;margin-top:6px;">v2.2 &middot; Uso Interno</div>
     </div>
 
     <div style="padding:14px 16px 8px;">

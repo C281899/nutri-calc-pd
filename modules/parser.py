@@ -48,10 +48,17 @@ def parse_ficha_tecnica(arquivo_bytes: bytes, extensao: str) -> list[dict]:
     except Exception:
         resultado = []
 
+    # Uma tabela nutricional (linhas "Proteínas 20 g", "Sódio 20 mg"...) não é
+    # uma receita: se a maioria dos "ingredientes" lidos são nomes de nutrientes,
+    # o arquivo é a ficha técnica de UM ingrediente.
     if resultado:
-        return resultado
+        n_nutrientes = sum(
+            1 for r in resultado if _campo_do_label(str(r["nome"]).lower())
+        )
+        if not (n_nutrientes >= 3 and n_nutrientes * 2 >= len(resultado)):
+            return resultado
 
-    # ── Fallback: tentar como ficha de ingrediente único (composição por 100g) ──
+    # ── Ficha de ingrediente único (composição por 100g) ──
     try:
         composicao = parse_composicao_nutricional(arquivo_bytes, ext)
         # Remove nome_comercial do dict de nutrientes, usa como nome
@@ -74,29 +81,57 @@ def parse_ficha_tecnica(arquivo_bytes: bytes, extensao: str) -> list[dict]:
 
 
 # ─── Padrões de extração (do mais ao menos específico) ───────────────────────
+# Número: aceita milhar e decimal juntos ("1.250,5"). Com o padrão anterior o
+# número era cortado em "1.250", a linha deixava de casar e o ingrediente
+# sumia da receita sem aviso.
 PADROES_QUANTIDADE = [
     # "Farinha de trigo (200g)" ou "Farinha de trigo (200 g)"
-    r"([A-Za-zÀ-ÿ][^(\n]{2,70}?)\s*\(\s*([\d]+[.,]?[\d]*)\s*(g|gramas?|kg|ml|l)\s*\)",
+    r"([A-Za-zÀ-ÿ][^(\n]{2,70}?)\s*\(\s*(\d+(?:[.,]\d+)*)\s*(g|gramas?|kg|ml|l)\s*\)",
     # "Farinha de trigo: 200g" — separador : ou – ou -
-    r"([A-Za-zÀ-ÿ][^:\-–\n]{2,70}?)\s*[:–\-]+\s*([\d]+[.,]?[\d]*)\s*(g|gramas?|kg|ml|l)\b",
+    r"([A-Za-zÀ-ÿ][^:\-–\n]{2,70}?)\s*[:–\-]+\s*(\d+(?:[.,]\d+)*)\s*(g|gramas?|kg|ml|l)\b",
     # "200g Farinha de trigo" — quantidade no início
-    r"^([\d]+[.,]?[\d]*)\s*(g|gramas?|kg)\b[\s:–\-]+([A-Za-zÀ-ÿ][^\n,;]{2,70}?)\s*$",
+    r"^(\d+(?:[.,]\d+)*)\s*(g|gramas?|kg)\b[\s:–\-]+([A-Za-zÀ-ÿ][^\n,;]{2,70}?)\s*$",
     # Pontos entre nome e quantidade: "Farinha ........ 200 g"
-    r"([A-Za-zÀ-ÿ][^.\n]{2,70}?)\.{2,}\s*([\d]+[.,]?[\d]*)\s*(g|gramas?|kg|ml)?\s*$",
+    r"([A-Za-zÀ-ÿ][^.\n]{2,70}?)\.{2,}\s*(\d+(?:[.,]\d+)*)\s*(g|gramas?|kg|ml)?\s*$",
     # Tabela tab/pipe: "Farinha de trigo \t 200 g"
-    r"([A-Za-zÀ-ÿ][^\t|\n]{2,70}?)[\t|]\s*([\d]+[.,]?[\d]*)\s*(g|gramas?|kg)?\s*$",
+    r"([A-Za-zÀ-ÿ][^\t|\n]{2,70}?)[\t|]\s*(\d+(?:[.,]\d+)*)\s*(g|gramas?|kg)?\s*$",
     # Espaço duplo entre nome e número: "Farinha de trigo   200"
-    r"([A-Za-zÀ-ÿ][a-zA-ZÀ-ÿ,. ()]{3,70}?)\s{2,}([\d]+[.,]?\d*)\s*(g|gramas?|kg|ml)?\s*$",
+    r"([A-Za-zÀ-ÿ][a-zA-ZÀ-ÿ,. ()]{3,70}?)\s{2,}(\d+(?:[.,]\d+)*)\s*(g|gramas?|kg|ml)?\s*$",
     # Vírgula como separador: "Farinha de trigo, 200g"
-    r"([A-Za-zÀ-ÿ][^,\n]{2,70}?),\s*([\d]+[.,]?[\d]*)\s*(g|gramas?|kg|ml)\b",
+    r"([A-Za-zÀ-ÿ][^,\n\d]{2,70}?),\s*(\d+(?:[.,]\d+)*)\s*(g|gramas?|kg|ml|l)\b",
+    # Nome seguido da quantidade no fim da linha: "Sal 2,5 g", "Ovos 3 unidades 150g"
+    r"^([A-Za-zÀ-ÿ][^\n:;|\t]{1,70}?)\s+(\d+(?:[.,]\d+)*)\s*(g|gramas?|kg|ml|l)\s*$",
 ]
 
 
+def _num_br(texto) -> float:
+    """
+    Converte texto numérico para float aceitando o formato brasileiro.
+    "200,5" → 200.5 | "1.250,00" → 1250.0 | "2.5" → 2.5 | "1.250" → 1250.0
+    Lança ValueError se não houver número.
+    """
+    t = str(texto).strip().replace(" ", "")
+    m = re.search(r"-?\d[\d.,]*", t)
+    if not m:
+        raise ValueError(f"sem número em {texto!r}")
+    t = m.group().rstrip(".,")
+    if "," in t and "." in t:
+        if t.rfind(",") > t.rfind("."):          # 1.250,00
+            t = t.replace(".", "").replace(",", ".")
+        else:                                     # 1,250.00
+            t = t.replace(",", "")
+    elif "," in t:
+        t = t.replace(",", ".")
+    elif re.fullmatch(r"-?\d{1,3}(\.\d{3})+", t):  # 1.250 (milhar)
+        t = t.replace(".", "")
+    return float(t)
+
+
 def _normalizar_quantidade(valor_str: str, unidade: str = "g") -> float:
-    """Converte valor de quantidade para gramas."""
-    val = float(valor_str.replace(",", "."))
+    """Converte valor de quantidade para gramas (kg e litros ×1000; mL ≈ g)."""
+    val = _num_br(valor_str)
     unidade = (unidade or "g").lower()
-    if unidade in ("kg", "quilograma", "quilogramas"):
+    if unidade in ("kg", "quilograma", "quilogramas", "l", "litro", "litros"):
         val *= 1000
     return val
 
@@ -117,9 +152,13 @@ def _extrair_por_regex(texto: str) -> list[dict]:
     """
     resultados = []
     vistos = set()
+    trechos_usados: list[tuple[int, int]] = []
 
     for padrao in PADROES_QUANTIDADE:
         for match in re.finditer(padrao, texto, re.IGNORECASE | re.MULTILINE):
+            ini, fim = match.span()
+            if any(ini < f and fim > i for i, f in trechos_usados):
+                continue  # trecho já interpretado por um padrão mais específico
             grupos = match.groups()
             try:
                 if len(grupos) >= 3:
@@ -154,6 +193,7 @@ def _extrair_por_regex(texto: str) -> list[dict]:
                 chave = f"{nome.lower().strip()}:{qtd}"
                 if chave not in vistos:
                     vistos.add(chave)
+                    trechos_usados.append((ini, fim))
                     resultados.append({"nome": nome, "quantidade_gramas": qtd})
 
             except (ValueError, AttributeError, IndexError):
@@ -306,7 +346,7 @@ def _detectar_colunas_excel(df: pd.DataFrame) -> list[dict]:
             for k in range(i + 1, len(df)):
                 try:
                     nome = str(df.iloc[k, col_ing]).strip()
-                    qtd  = float(str(df.iloc[k, col_qtd]).replace(",", "."))
+                    qtd  = _num_br(df.iloc[k, col_qtd])
                     if nome and nome.lower() not in ("nan", "") and qtd > 0:
                         resultados.append({"nome": nome, "quantidade_gramas": qtd})
                 except (ValueError, IndexError):
@@ -321,7 +361,7 @@ def _detectar_colunas_excel(df: pd.DataFrame) -> list[dict]:
                 if col_texto == col_num:
                     continue
                 serie_texto = df[col_texto].astype(str)
-                serie_num   = pd.to_numeric(df[col_num], errors="coerce")
+                serie_num   = df[col_num].map(_num_ou_nan)
 
                 if serie_texto.str.len().gt(2).sum() >= 2 and serie_num.notna().sum() >= 2:
                     resultados = []
@@ -337,6 +377,17 @@ def _detectar_colunas_excel(df: pd.DataFrame) -> list[dict]:
                         return resultados
 
     return []
+
+
+def _num_ou_nan(valor) -> float:
+    """_num_br que devolve NaN para células vazias ou com texto (nomes)."""
+    t = str(valor).strip()
+    if not t or t.lower() == "nan" or re.search(r"[A-Za-zÀ-ÿ]{3,}", t):
+        return float("nan")
+    try:
+        return _num_br(t)
+    except ValueError:
+        return float("nan")
 
 
 def _parse_csv(conteudo: bytes) -> list[dict]:
@@ -357,7 +408,9 @@ def _parse_csv(conteudo: bytes) -> list[dict]:
             break
 
     try:
-        df = pd.read_csv(io.StringIO(texto), sep=separador)
+        # header=None + texto: o detector procura o cabeçalho nas primeiras linhas
+        df = pd.read_csv(io.StringIO(texto), sep=separador, header=None,
+                         dtype=str, keep_default_na=False, engine="python")
         resultados = _detectar_colunas_excel(df)
     except Exception:
         resultados = []
@@ -457,9 +510,9 @@ def _processar_tabela(tabela: list[list[Any]]) -> list[dict]:
             if not nome or not qtd_str:
                 continue
 
-            numeros = re.findall(r'[\d]+[.,]?[\d]*', qtd_str)
+            numeros = re.findall(r'\d[\d.,]*', qtd_str)
             if numeros:
-                qtd = float(numeros[0].replace(",", "."))
+                qtd = _num_br(numeros[0])
                 nome_limpo = _limpar_nome(nome)
                 if qtd > 0 and len(nome_limpo) >= 2 and any(c.isalpha() for c in nome_limpo):
                     resultados.append({"nome": nome_limpo, "quantidade_gramas": qtd})
@@ -565,7 +618,8 @@ def parse_composicao_nutricional(arquivo_bytes: bytes, extensao: str) -> dict:
         else:
             texto = arquivo_bytes.decode("utf-8", errors="replace")
         for linha in texto.splitlines():
-            partes = re.split(r'[\t;,|]', linha, maxsplit=1)
+            # vírgula só separa colunas quando NÃO é vírgula decimal ("6,5 g")
+            partes = re.split(r'[\t;|]|,(?!\d)', linha, maxsplit=1)
             if len(partes) == 2:
                 pares.append((partes[0].strip(), partes[1].strip()))
     else:
@@ -574,10 +628,9 @@ def parse_composicao_nutricional(arquivo_bytes: bytes, extensao: str) -> dict:
     # Tentar mapear a partir de pares (tabela) — mais preciso
     resultado = _mapear_pares_nutricionais(pares)
 
-    # Complementar com texto livre se poucos campos extraídos
-    campos_nut = [k for k in resultado if k != 'nome_comercial']
-    if len(campos_nut) < 3:
-        resultado.update(_mapear_texto_nutricional(texto))
+    # Complementar com texto livre apenas os campos que a tabela não trouxe
+    for campo, valor in _mapear_texto_nutricional(texto).items():
+        resultado.setdefault(campo, valor)
 
     if not any(k != 'nome_comercial' for k in resultado):
         raise ValueError(
@@ -742,26 +795,81 @@ def _ocr_pdf(pdf_bytes: bytes) -> tuple[str, list[tuple[str, str]]]:
 
 # ─── Mapeamento de labels nutricionais ────────────────────────────────────────
 
+# Rótulos de sub-nutrientes que NÃO podem ser lidos como o nutriente "pai"
+# (ex.: "Gorduras saturadas" não é "Gorduras totais").
+_SUBNUTRIENTES = ("saturad", "trans", "monoinsat", "mono-insat", "poliinsat",
+                  "poli-insat", "insaturad", "açúcar", "acucar", "azúcar",
+                  "sugar", "lactose", "dos quais", "das quais", "of which",
+                  "solúvel", "soluvel", "insolúvel", "insoluvel")
+
+# Campos gravados em mg: valores informados em gramas são convertidos.
+_CAMPOS_MG = {"sodio", "colesterol", "calcio", "ferro", "fosforo", "potassio",
+              "magnesio", "zinco", "cobre", "manganes", "vitamina_c",
+              "vitamina_e", "tiamina", "riboflavina", "piridoxina", "niacina"}
+
+
+def _campo_do_label(label_n: str) -> tuple[str, str] | None:
+    """Devolve (campo, sinônimo encontrado) para um rótulo já em minúsculas."""
+    if any(sub in label_n for sub in _SUBNUTRIENTES):
+        return None
+    for campo, sinonimos in _MAPA_NUTRIENTES.items():
+        for s in sinonimos:
+            # sinônimos curtos ("kj", "b1", "fat") só valem como palavra inteira
+            if len(s) <= 3:
+                if re.search(rf"(?<![a-zà-ÿ0-9]){re.escape(s)}(?![a-zà-ÿ0-9])", label_n):
+                    return campo, s
+            elif s in label_n:
+                return campo, s
+    return None
+
+
+def _valor_com_unidade(campo: str, label_n: str, valor_txt: str) -> float | None:
+    """Primeiro número de valor_txt; converte g → mg quando o campo é em mg."""
+    val = _primeiro_numero(valor_txt)
+    if val is None:
+        return None
+    if campo in _CAMPOS_MG:
+        unidade = re.search(r"\d\s*(mg|mcg|µg|ug|g)\b", valor_txt.lower())
+        em_gramas = (unidade and unidade.group(1) == "g") or (
+            not unidade and re.search(r"\(\s*g\s*\)", label_n)
+        )
+        if em_gramas:
+            val *= 1000
+    return val
+
+
+def _registrar_energia(resultado: dict, label_n: str, valor_txt: str) -> None:
+    """Lê kcal/kJ de '350 kcal = 1470 kJ' ou de um número sem unidade."""
+    kcal, kj = _extrair_kcal_kj(valor_txt)
+    if kcal is None and kj is None:
+        numero = _primeiro_numero(valor_txt)
+        if numero is not None:
+            if re.search(r"k\s*j", label_n) and "kcal" not in label_n:
+                kj = numero
+            else:
+                kcal = numero
+    if kcal is not None:
+        resultado.setdefault("energia_kcal", kcal)
+    if kj is not None:
+        resultado.setdefault("energia_kj", kj)
+
+
 def _mapear_pares_nutricionais(pares: list[tuple[str, str]]) -> dict:
     """Mapeia pares (label, valor_texto) para campos do banco."""
     resultado: dict = {}
 
     for label, valor_txt in pares:
         label_n = label.lower().strip()
-
-        for campo, sinonimos in _MAPA_NUTRIENTES.items():
-            if any(s in label_n for s in sinonimos):
-                if campo == 'energia_kcal':
-                    kcal, kj = _extrair_kcal_kj(valor_txt)
-                    if kcal is not None:
-                        resultado.setdefault('energia_kcal', kcal)
-                    if kj is not None:
-                        resultado.setdefault('energia_kj', kj)
-                else:
-                    val = _primeiro_numero(valor_txt)
-                    if val is not None:
-                        resultado.setdefault(campo, val)
-                break
+        achado = _campo_do_label(label_n)
+        if not achado:
+            continue
+        campo, _ = achado
+        if campo in ("energia_kcal", "energia_kj"):
+            _registrar_energia(resultado, label_n, valor_txt)
+        else:
+            val = _valor_com_unidade(campo, label_n, valor_txt)
+            if val is not None:
+                resultado.setdefault(campo, val)
 
     return resultado
 
@@ -779,47 +887,42 @@ def _mapear_texto_nutricional(texto: str) -> dict:
         if not linha_n:
             continue
 
-        for campo, sinonimos in _MAPA_NUTRIENTES.items():
-            if not any(s in linha_n for s in sinonimos):
-                continue
+        achado = _campo_do_label(linha_n)
+        if not achado:
+            continue
+        campo, sinonimo = achado
+        # O valor é o que vem DEPOIS do nome do nutriente — assim o "12" de
+        # "Vitamina B12 2,4 mcg" não é lido como o valor.
+        resto = linha[linha_n.index(sinonimo) + len(sinonimo):]
 
-            if campo in ("energia_kcal", "energia_kj"):
-                # Juntar esta linha com as próximas até encontrar "X kcal" ou "X kJ"
-                janela = linha
+        if campo in ("energia_kcal", "energia_kj"):
+            # Juntar esta linha com as próximas até encontrar "X kcal" ou "X kJ"
+            janela = resto
+            if not re.search(r"\d", janela):
                 for j in range(i + 1, min(i + 8, n)):
                     if linhas[j]:
                         janela += " " + linhas[j]
                         if re.search(r"\d\s*k(?:cal|j)", linhas[j], re.IGNORECASE):
                             break
-                kcal, kj = _extrair_kcal_kj(janela)
-                if kcal is not None:
-                    resultado.setdefault("energia_kcal", kcal)
-                if kj is not None:
-                    resultado.setdefault("energia_kj", kj)
-            else:
-                val = _primeiro_numero(linha)
-                if val is None:
-                    # Valor pode estar na linha seguinte ou anterior (tabela 2 colunas)
-                    for delta in (1, -1, 2, -2):
-                        j = i + delta
-                        if 0 <= j < n and linhas[j]:
-                            adj = linhas[j]
-                            adj_n = adj.lower()
-                            # Ignorar linhas que são outro label de nutriente
-                            is_label = any(
-                                any(s in adj_n for s in sinos)
-                                for sinos in _MAPA_NUTRIENTES.values()
-                            )
-                            # Ignorar números de seção ("7.", "7.1 Se...")
-                            is_section = bool(re.match(r"^\d+\.\d*\s+[A-Za-z]", adj))
-                            if not is_label and not is_section:
-                                v = _primeiro_numero(adj)
-                                if v is not None:
-                                    val = v
-                                    break
-                if val is not None:
-                    resultado.setdefault(campo, val)
-            break
+            _registrar_energia(resultado, linha_n, janela)
+            continue
+
+        val = _valor_com_unidade(campo, linha_n, resto)
+        if val is None:
+            # Valor pode estar na linha seguinte ou anterior (tabela 2 colunas)
+            for delta in (1, -1, 2, -2):
+                j = i + delta
+                if 0 <= j < n and linhas[j]:
+                    adj = linhas[j]
+                    is_label = _campo_do_label(adj.lower()) is not None
+                    # Ignorar números de seção ("7.", "7.1 Se...")
+                    is_section = bool(re.match(r"^\d+\.\d*\s+[A-Za-z]", adj))
+                    if not is_label and not is_section:
+                        val = _valor_com_unidade(campo, linha_n, adj)
+                        if val is not None:
+                            break
+        if val is not None:
+            resultado.setdefault(campo, val)
 
     return resultado
 
