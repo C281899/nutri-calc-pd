@@ -207,6 +207,10 @@ TACO_EMBUTIDA = [
 #           ca, mg, mn, p, fe, na, k, cu, zn, retinol, re, rae, tia, ribo, pirid,
 #           niac, vitc, vitd, vite, vitb12, fonte)
 TACO_SUPLEMENTO = [
+    # ─── BASE DE FORMULAÇÃO ───────────────────────────────────────────────────
+    # Água de processo: sem nutrientes, mas entra no peso da receita (dilui os
+    # valores por 100 g). Sem ela não dá para formular bebidas, caldas e massas.
+    ("Água potável","Bebidas",100.0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,"Valor de referência"),
     # ─── LATICÍNIOS ESPECIALIZADOS ────────────────────────────────────────────
     ("Queijo edam","Leite e derivados",44.0,357,1494,24.4,27.8,89,1.4,0,3.8,731,30,0.01,536,0.44,965,188,0.04,3.75,186,186,56,0.03,0.39,0.07,0.06,0,None,0.24,1.54,"USDA-adaptado"),
     ("Queijo gouda","Leite e derivados",41.5,356,1490,24.9,27.4,114,2.2,0,3.9,700,29,0.01,546,0.24,819,121,0.04,3.28,165,165,49,0.03,0.31,0.08,0.07,0,None,0.24,1.54,"USDA-adaptado"),
@@ -736,25 +740,50 @@ TACO_SUPLEMENTO_2 = [
 ]
 
 
-def baixar_taco_excel(destino: str) -> bool:
-    """Tenta baixar a planilha TACO 4ª edição do servidor UNICAMP."""
+def baixar_taco_excel(destino: str, timeout: float = 20.0) -> bool:
+    """Tenta baixar a planilha TACO 4ª edição do servidor UNICAMP.
+
+    Tem tempo limite (sem ele uma conexão travada segurava a inicialização do
+    app indefinidamente) e grava em arquivo temporário, para que um download
+    interrompido não deixe uma planilha corrompida no lugar.
+    """
+    tmp = destino + ".parcial"
     try:
         import urllib.request
         print(f"  → Baixando TACO de {URL_TACO} ...")
-        urllib.request.urlretrieve(URL_TACO, destino)
+        with urllib.request.urlopen(URL_TACO, timeout=timeout) as resp, open(tmp, "wb") as f:
+            while True:
+                bloco = resp.read(64 * 1024)
+                if not bloco:
+                    break
+                f.write(bloco)
+        os.replace(tmp, destino)
         size_kb = os.path.getsize(destino) // 1024
         print(f"  → Download concluído ({size_kb} KB).")
         return True
     except Exception as e:
         print(f"  ⚠️  Não foi possível baixar TACO automaticamente: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
         return False
 
 
 def criar_taco_db():
-    """Cria e popula o banco de dados TACO."""
+    """Cria e popula o banco de dados TACO.
+
+    O banco é montado em um arquivo temporário e só então renomeado para
+    taco.db: se o processo cair no meio, não sobra um banco pela metade.
+    """
     print(f"→ Criando banco TACO em: {TACO_DB}")
-    conn = sqlite3.connect(TACO_DB)
-    conn.execute("PRAGMA journal_mode=WAL")
+    tmp_db = TACO_DB + ".novo"
+    for resto in (tmp_db, tmp_db + "-wal", tmp_db + "-shm"):
+        if os.path.exists(resto):
+            os.remove(resto)
+
+    conn = sqlite3.connect(tmp_db)
     conn.executescript(SQL_TACO_DB)
 
     # 1) Tentar arquivo local; se não existir, baixar
@@ -779,8 +808,9 @@ def criar_taco_db():
     importar_suplemento(conn)
 
     conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM alimentos_taco").fetchone()[0]
     conn.close()
-    count = sqlite3.connect(TACO_DB).execute("SELECT COUNT(*) FROM alimentos_taco").fetchone()[0]
+    os.replace(tmp_db, TACO_DB)
     print(f"  ✅ {count} alimentos carregados na TACO.")
 
 
@@ -872,6 +902,34 @@ def importar_taco_embutida(conn: sqlite3.Connection):
     for registro in TACO_EMBUTIDA:
         conn.execute(f"INSERT INTO alimentos_taco ({col_names}) VALUES ({placeholders})", registro)
     print(f"  → {len(TACO_EMBUTIDA)} alimentos da base embutida inseridos.")
+
+
+def completar_suplemento() -> int:
+    """
+    Acrescenta a um taco.db JÁ EXISTENTE os itens do suplemento que ainda não
+    estão nele (ex.: itens novos após uma atualização do app). Não altera nem
+    remove nada. Retorna quantos itens foram incluídos.
+    """
+    if not os.path.exists(TACO_DB):
+        return 0
+    import unicodedata
+
+    def _chave(nome: str) -> str:
+        return unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode().lower().strip()
+
+    cols = [col for col, _ in COLUNAS_TACO] + ['fonte']
+    sql = (f"INSERT INTO alimentos_taco ({', '.join(cols)}) "
+           f"VALUES ({', '.join('?' for _ in cols)})")
+    conn = sqlite3.connect(TACO_DB)
+    try:
+        existentes = {_chave(r[0]) for r in conn.execute("SELECT nome_alimento FROM alimentos_taco")}
+        novos = [r for r in TACO_SUPLEMENTO + TACO_SUPLEMENTO_2 if _chave(r[0]) not in existentes]
+        if novos:
+            conn.executemany(sql, novos)
+            conn.commit()
+        return len(novos)
+    finally:
+        conn.close()
 
 
 def importar_suplemento(conn: sqlite3.Connection):

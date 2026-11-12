@@ -313,18 +313,12 @@ def _carregar_excel_local(con) -> bool:
 
 
 def _tentar_download_e_seed(con):
-    """Tenta download da TBCA; usa seed como fallback."""
-    try:
-        import requests
-        resp = requests.get(URL_TBCA_BASE, timeout=8)
-        if resp.status_code == 200:
-            print("[tbca_setup] Site TBCA acessível. Usando seed data como referência.")
-        else:
-            print(f"[tbca_setup] Site TBCA retornou {resp.status_code}. Usando seed data.")
-    except Exception as e:
-        print(f"[tbca_setup] Download TBCA não disponível: {e}. Usando seed data.")
-    finally:
-        _inserir_seed(con)
+    """Popula com os dados seed embutidos.
+
+    (Antes havia aqui uma requisição ao site da TBCA cujo resultado era
+    descartado — só atrasava a inicialização em até 8 s. Removida.)
+    """
+    _inserir_seed(con)
 
 
 def _inserir_seed(con):
